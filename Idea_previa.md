@@ -123,8 +123,7 @@ IMPORTANTE TESTEAR
 
 Se deberia de analizar si el cliente a entrar en dicha arquitectura esta al mismo nivel vertical que los demás ya que puede suponer una degradacion de rendimientos en los demas tenant. Posible solucion crear una solucion especifica para el cliente o si se prevee clientes con mismas necesidades crear otro multitenant(estudiar viabilidad para rdto optimo sin latencais), de dicha manera nos quitamos los incovenientes de escalabilidad vertical. Para ello deberiamos visualizar el nivel previsto de exigencias y escoger un stack diferente según las necesidades.
 
-Row-Level Security como mecanismo, no como capa
-Dentro de shared schema, la pregunta "¿quién impone el aislamiento?" es ortogonal a dónde viven los datos. Sin RLS, el aislamiento depende de que la app nunca olvide el WHERE tenant_id = ?. Con RLS, el motor de BBDD lo impone aunque la query de la capa de aplicación esté mal escrita. Mismo modelo de datos (shared schema), garantía distinta.
+
 
 Opciones en multitenant
 
@@ -187,16 +186,269 @@ La capa de acceso a datos (ORM/query builder) lee ese contexto automáticamente 
 
 Con ORMs como Prisma o SQLAlchemy esto se implementa con hooks/interceptors globales, no repitiendo el filtro en cada repositorio.
 
-Seguridad: lo analizare en el archivo idea_seguridad.md
 
+Row-Level Security como mecanismo, no como capa
+Dentro de shared schema, la pregunta "¿quién impone el aislamiento?" es ortogonal a dónde viven los datos. Sin RLS, el aislamiento depende de que la app nunca olvide el WHERE tenant_id = ?. Con RLS, el motor de BBDD lo impone aunque la query de la capa de aplicación esté mal escrita. Mismo modelo de datos (shared schema), garantía distinta.
 
+TEMA DE SEGURIDAD: 
+
+4.1 Contexto del tenant en las peticiones (JWT firmado)
+Qué es
+
+El tenant_id viaja dentro del payload del JWT, firmado criptográficamente por el servidor de autenticación, en vez de pasarse como parámetro de URL (?tenant=acme) o header manipulable por el cliente.
+
+Ventajas
+El cliente no puede alterar su propio tenant_id porque la firma del JWT lo invalidaría.
+Un único punto de verdad para la identidad + contexto de tenant, en cada request.
+Compatible con arquitecturas stateless (no requiere consultar sesión en servidor en cada request si el JWT es autocontenido).
+Inconvenientes
+Si el JWT tiene TTL largo y el usuario cambia de tenant (multi-tenant membership, ej. un consultor que trabaja para varios clientes), el token queda desactualizado hasta que expira o se refresca.
+Revocación complicada: si un tenant es suspendido/baneado, los JWT ya emitidos siguen siendo válidos hasta que expiran, salvo que implementes una blacklist.
+Puntos críticos
+Nunca confiar en un tenant_id que venga en el body o en la URL sin contrastarlo contra el JWT. Un endpoint que acepta tenant_id como parámetro de request body y no lo valida contra el del token es una vulnerabilidad de escalación horizontal (IDOR).
+El JWT debe firmarse con un secreto/clave que nunca esté expuesta en el cliente ni en el código fuente (usar variables de entorno o un servicio de secrets como Vault/AWS Secrets Manager).
+Costes en tokens
+
+No aplica (esto es JWT de autenticación, no tokens de LLM — cuidado con no confundir terminología en tu memoria de TFG, un evaluador técnico notará si mezclas ambos conceptos).
+
+Buenas prácticas
+Usar RS256 (firma asimétrica) en vez de HS256 (simétrica) si vas a validar el JWT en múltiples servicios/microservicios — así solo el servicio de auth tiene la clave privada, y el resto solo necesita la pública para verificar.
+TTL corto (15-30 min) para el access token + refresh token de vida más larga, para poder revocar/actualizar el tenant_id con frecuencia razonable.
+Incluir también el user_id y roles dentro del mismo JWT para no tener que hacer una consulta adicional a BBDD en cada request solo para autorización.
+Cuellos de botella
+Verificación de firma RS256 es más costosa computacionalmente que HS256; en sistemas de muy alto volumen de requests esto se nota, aunque para un SaaS de tamaño medio no es relevante.
+Errores comunes
+Meter datos sensibles del tenant (no solo el ID) dentro del JWT — el payload de un JWT es solo Base64, no está cifrado, cualquiera puede leerlo.
+Olvidar invalidar tokens tras cambio de plan/suspensión del tenant.
+Legalidad/GRC
+Si el JWT contiene datos personales identificables además del tenant_id, esos datos "viajan" en cada request y quedan potencialmente en logs de proxies/CDN — revisar qué se loguea downstream.
+4.2 Autorización y seguridad (aislamiento estricto entre tenants)
+Qué es
+
+El conjunto de políticas (a nivel de aplicación y/o de BBDD) que garantizan que ninguna petición, bajo ningún flujo, puede devolver o modificar datos de un tenant distinto al autenticado.
+
+Ventajas
+
+Es la garantía central que hace viable un SaaS multitenant frente a clientes que preguntarán explícitamente por esto en el proceso de compra (especialmente en B2B).
+
+Inconvenientes
+
+Implementarlo correctamente implica defensa en capas (defense in depth), lo cual añade complejidad y superficie de testing respecto a una app single-tenant.
+
+Puntos críticos
+Doble capa obligatoria: autorización a nivel de aplicación (middleware) + autorización a nivel de BBDD (RLS). Confiar solo en la primera es el error que más incidentes reales ha causado en SaaS multitenant — un solo endpoint nuevo que se salte el middleware (por ejemplo, un endpoint de "admin" o "soporte interno" añadido con prisas) expone datos de todos los tenants.
+Los agentes de IA de tu proyecto son un vector de riesgo adicional aquí: si un agente tiene function-calling con acceso a una función que consulta BBDD, esa función debe heredar el mismo contexto de tenant que el request original, no ejecutarse con permisos elevados "porque es el LLM el que lo pide".
+Costes en tokens
+
+Relevante indirectamente: si implementas guardrails de IA que validan que el agente no intente acceder a datos fuera de su tenant, eso añade una llamada extra (o un paso de validación) que puede sumar tokens si se hace vía LLM en vez de vía código determinista. Recomendación: esta validación debe ser código determinista (if tenant_id != contexto → rechazar), nunca delegada al LLM, porque un LLM puede ser manipulado vía prompt injection para saltarse una instrucción en texto.
+
+Buenas prácticas
+Autorización basada en políticas explícitas (ABAC/RBAC) evaluadas en un punto central, no dispersas en cada controlador.
+Tests de penetración internos específicos: intentar, autenticado como tenant A, acceder a recursos de tenant B por ID directo (ej. /api/conversaciones/{id} con un ID que pertenece a otro tenant) — este es el test de aislamiento más básico y el que más suele fallar en auditorías reales.
+Principio de mínimo privilegio también para el propio backend: el usuario de BBDD que usa la aplicación no debería poder hacer BYPASS RLS (en Postgres, el rol BYPASSRLS debe reservarse solo para tareas administrativas offline).
+Cuellos de botella
+
+Verificaciones de autorización añaden latencia por request si se hacen contra servicios externos (ej. políticas evaluadas vía un servicio tipo OPA/Open Policy Agent remoto) — normalmente asumible, pero hay que medirlo bajo carga.
+
+Errores comunes
+Autorización "por omisión permitida" (si no se especifica lo contrario, se permite) en vez de "por omisión denegada" (deny by default).
+Probar el aislamiento solo manualmente en desarrollo y no como suite automatizada de regresión.
+Legalidad/GRC
+
+Este punto es el núcleo de cualquier auditoría de seguridad (ISO 27001, SOC 2) que un cliente B2B pueda exigir antes de firmar contrato. Documentar el modelo de autorización y sus tests es, en la práctica, parte de la evidencia de compliance.
+
+4.3 Métricas, logs y rate limiting segmentados por tenant
+Qué es
+
+Toda observabilidad (logs de aplicación, métricas de uso, límites de tasa de peticiones) debe estar etiquetada y agregada por tenant_id, no solo a nivel global de sistema.
+
+Ventajas
+Permite diagnosticar problemas específicos de un cliente sin "ruido" del resto.
+Habilita planes de precios basados en uso real (rate limiting por tenant = básico para modelo freemium/tiers).
+Aísla el impacto de un tenant abusivo (accidental o malicioso) sin afectar al resto — mitiga el problema de "noisy neighbor" mencionado antes.
+Inconvenientes
+
+Añade dimensionalidad a toda tu infraestructura de observabilidad: más cardinalidad en métricas (un tenant_id por cada tenant activo) puede encarecer herramientas de monitoring que cobran por cardinalidad (ej. Datadog, Prometheus con muchas etiquetas).
+
+Puntos críticos
+Logs con datos personales: si logueas payloads completos de requests que incluyen datos de usuario final, y esos logs no están segmentados con control de acceso por tenant, cualquier ingeniero con acceso a logs puede ver datos de todos los clientes — esto es un problema de GRC, no solo técnico.
+Rate limiting mal implementado a nivel global (en vez de por tenant) permite que un tenant "ruidoso" agote la cuota de toda la plataforma, afectando a clientes que pagan más.
+Costes en tokens
+
+Aquí es donde el tracking de tokens por tenant (ya diseñado en el punto anterior de la conversación) se conecta directamente con el rate limiting: la lógica de "tenant X ha superado 100k tokens este mes en plan Basic → bloquear o degradar a modelo más barato" debe evaluarse en tiempo real, antes de hacer la llamada al LLM (para no gastar la llamada y luego rechazar).
+
+Buenas prácticas
+Usar tenant_id como label/tag obligatorio en toda métrica desde el diseño del sistema de logging (structured logging con JSON, no logs de texto plano).
+Rate limiting con algoritmo token bucket o sliding window por tenant, implementado en una capa rápida (Redis) para no penalizar la latencia del request.
+Alertas automáticas por tenant que se acerque a su límite, no solo bloqueo silencioso al llegar al 100%.
+Cuellos de botella
+
+Consultar límites de rate limiting en Redis en cada request añade una llamada de red extra; en sistemas de alto volumen esto se optimiza con lógica de "leaky bucket" local con sincronización periódica, en vez de consulta síncrona en cada petición.
+
+Errores comunes
+Rate limiting aplicado solo en el API Gateway global, sin diferenciar planes de tenant (todos comparten el mismo límite).
+Logs sin rotación/retención definida por tenant — algunos clientes (según contrato/RGPD) pueden exigir borrado de sus logs tras cierto periodo, y si están mezclados con los de otros tenants, borrar selectivamente es complejo.
+Legalidad/GRC
+RGPD: los logs que contienen datos personales están sujetos a las mismas obligaciones de minimización y retención limitada que cualquier otro dato personal. Segmentar por tenant facilita cumplir "derecho al olvido" de forma quirúrgica.
+Rate limiting por tenant también es relevante para SLA contractuales (si prometes cierto throughput a un cliente Enterprise, debes poder demostrarlo con métricas segmentadas).
+4.4 Independencia de la estructura arquitectónica (monolito vs microservicios vs hexagonal)
+Qué es
+
+El multitenant es una decisión ortogonal al estilo arquitectónico general de la aplicación: se puede implementar tanto en un monolito como en microservicios o en una arquitectura limpia/hexagonal, porque el aislamiento de tenant es una preocupación transversal (cross-cutting concern), no una decisión de descomposición de servicios.
+
+Ventajas
+Te da libertad para elegir la arquitectura según otros criterios (complejidad del equipo, tamaño del proyecto) sin que la multitenencia fuerce la decisión.
+Para un proyecto de prácticas/TFG, esto es una ventaja práctica directa: puedes justificar un monolito modular (más simple de defender y de terminar a tiempo) sin que eso reste rigor a la solución multitenant.
+Inconvenientes
+En microservicios, el contexto de tenant debe propagarse entre servicios (vía JWT, headers, o contexto distribuido tipo OpenTelemetry baggage), lo cual añade complejidad de "plumbing" que en un monolito es trivial (una sola inyección de contexto).
+En arquitectura hexagonal, hay que decidir en qué capa vive la resolución del tenant (normalmente en el adaptador de entrada, nunca en el dominio) para no contaminar la lógica de negocio con detalles de infraestructura.
+Puntos críticos
+
+Si migras de monolito a microservicios más adelante, el mecanismo de propagación de tenant_id entre servicios es uno de los puntos que más fricción genera si no se diseñó pensando en ello desde el principio (aunque el punto de partida sea un monolito).
+
+Costes en tokens
+
+No aplica directamente — es una decisión estructural, no de consumo de IA.
+
+Buenas prácticas
+Para un proyecto de tu envergadura (prácticas/TFG), monolito modular con arquitectura hexagonal/limpia interna es la opción más defendible: separas claramente dominio, aplicación e infraestructura, y el tenant se resuelve en el adaptador de entrada (ej. middleware HTTP), sin tocar el núcleo de negocio.
+Si en algún momento documentas "cómo escalaría esto a microservicios", demuestra que entiendes la propagación de contexto — es un punto que suma mucho en una defensa de TFG o entrevista técnica, sin que tengas que implementarlo realmente.
+Cuellos de botella
+
+No aplica de forma directa a esta decisión en sí (los cuellos de botella dependen del modelo de datos elegido, ya cubierto en 4.1-4.3).
+
+Errores comunes
+
+Sobre-diseñar microservicios para un proyecto de este alcance "porque suena más profesional" — en la práctica, un evaluador técnico valorará más un monolito bien estructurado (con separación de capas clara) que microservicios mal delimitados por falta de experiencia previa gestionando sistemas distribuidos.
+
+Legalidad/GRC
+
+No aplica directamente a la elección arquitectónica en sí, salvo que microservicios distribuidos en distintas regiones/nubes puedan complicar la localización de datos exigida por RGPD si no se controla explícitamente dónde corre cada servicio.
+
+Alternativas de stack/arquitectura (aplicable a los 4 puntos en conjunto)
+Necesidad	Opción estándar	Alternativa competitiva	Trade-off
+JWT + gestión de identidad	Auth propio (ej. con jsonwebtoken en Node o PyJWT)	Auth0 / Clerk / Supabase Auth (gestionado)	Gestionado = menos control pero cero mantenimiento de seguridad de auth; propio = más control pero tú asumes el riesgo de bugs de seguridad en algo tan crítico
+Autorización por políticas	Lógica ad-hoc en middleware	Open Policy Agent (OPA) o Cerbos	Herramientas dedicadas centralizan políticas y son auditables, pero añaden una pieza de infraestructura más a aprender/mantener — para tu alcance, probablemente sobredimensionado
+Rate limiting	Implementación propia con Redis	API Gateway con rate limiting nativo (Kong, AWS API Gateway)	El gateway resuelve esto "gratis" a nivel de infraestructura, pero añade una capa más y coste si es cloud gestionado
+Logs/observabilidad multitenant	Stack propio (Winston/Pino + Grafana Loki)	Datadog / New Relic (gestionado, con tagging nativo)	Gestionado es más rápido de implementar bien pero tiene coste recurrente que escala con volumen — para un TFG, el stack propio con Loki es más defendible económicamente y técnicamente
 
 
 
 
 COSAS EN LIMPIO:
 
+Se deberia de analizar si el cliente a entrar en dicha arquitectura esta al mismo nivel vertical que los demás ya que puede suponer una degradacion de rendimientos en los demas tenant. Posible solucion crear una solucion especifica para el cliente o si se prevee clientes con mismas necesidades crear otro multitenant(estudiar viabilidad para rdto optimo sin latencais), de dicha manera nos quitamos los incovenientes de escalabilidad vertical. Para ello deberiamos visualizar el nivel previsto de exigencias y escoger un stack diferente según las necesidades.
+
 Tras analizar como se podria estructurar la bbdd según las diferentes exigencias de los clientes, llego a la conclusión en nuestro caso que lo mas conveniente seria Shared schema (pool) + Row-Level Security, sin particionado ni sharding. ¿Porque? El sharding nos cubre de problemas que en principio
 no necesitamos cubrir debido a las necesidades de nuestro caso, si aceptaramos una escalabilidad de clientes dentro de este multitenant estudiariamos la opción mas viable para una migración, si no se diseña algo personal u otro multitenant, de la misma manera para el particionado físico, ya que esta resuuelve problemas para el borrado rapido cuando las tablas son demasiado grandes, por lo que el delete masivo es un cuello de botella real, ademas que el mantenimiento constante no lo hace práctico debidoal consumo de tiempo para nuestra situación, no es óptimo, particionar por tenant_id es una optimización de escala y de operaciones (borrado rápido, rendimiento en tablas grandes) que no aporta seguridad, y con exigencia media-baja el problema que resuelve todavía no existe — así que solo queda el coste de mantenerla, sin el beneficio. Para el caso de extender el eje a cómputo, red y cuenta cloud es una opción muy interesante pero lo descarto por la sencilla razón de nuestro target (la complejidad de explicar y auditar va a cada capa y para casos reales a los que apuntamos no tiene sentido dicha caer en dicha complejidad, ya que complicariamos mucho la venta del SaaS y perderiamos potenciales clientes), tampoco se benefician los problemas que resuelve ya que aisla cómputos para no saturar la cpu/memoria cosa que no nos va a pasar al igual que el aislamiento por red ya que es altamente burocratico (sector financiero, salud y defensa) como con cuenta cloud, que normamelmente lo piden clientes de auditorias.El despliegue serai muy grande porque dependeria de N desiciones independientes cada uno con su propio coste, además de que al requerir tanta configuración se puede caer en la incosistencia, en deefinitica contradice nuestro argumento de coste-beneficio.
 
-RLS:
+En buenas practicas para la seguridad aconsejan seguir 4 pasos:
+
+1.- tenant_id con token de autenticacion (JWT). Esto supone ventajas en seguridad ya que el cliente no puede alterar su propio tenant_id, pero presenta varios incovenientes sensibles a considerar y subsanar. Primero: JWT con TTL largo, si el ususario cambia de tenant (como sera nuestro caso) el token queda desactualizado hasta que expira o se refresca, esto supone un impacto a nivel producción, y se puede dar en escenarios como: 
+    1.1 Usuario expulsado de un tenant mid-sesion
+    1.2Tenant suspendido
+    1.3 Usuario con membership en varios tenants  
+    1-4 Downgrade de plan/permisos
+La solución para estos casos con agentes de IA interviniendo, consiste en:
+ recortar el TTL para el acces token, 
+ revalidación server-side en operaciones sensibles (no confiar unicamente en el JWT),
+ establecer una blacklist para que los tokens emitidos de un tenant suspendido dejen de ser válidos
+ refresh token rotation con validacion de membership
+ forzar reissue de token al cambiar de tenant activo (para los casos de multitentant membership, al hacer el cambio de contexto en la UI dispare la llamada al backend para estar conectado a su tenant correcto y evitar el error de desajuste en frontend)
+ Contrastar el tenant_id contra el JWT, no confiar que venga en el body o en la URL, es una vulnerabilidad de esalacion horizontal si no se hace.
+ JWT firmado con un secreto/clave que nunca este expuesta en el cliente ni en el código fuente. (Vault/AWS Secrets)
+ Usar RS256 (firma asimétrica) en vez de HS256 (simétrica) si vas a validar el JWT en múltiples servicios/microservicios — así solo el servicio de auth tiene la clave privada, y el resto solo necesita la pública para verificar.
+ Incluir también el user_id y roles dentro del mismo JWT para no tener que hacer una consulta adicional a BBDD en cada request solo para autorización.
+ 2.- Autorización y seguridad, capa especialmente buena para procesos B2B. Presenta dos puntos críticos a resolver;
+    2.1 Doble capa obligatoria: autorizacion a nivel de aplicacion (middleware) y autorización a nivel de BBDD (nuestro RLS)
+    2.2 Los agentes de IA al tener function-calling con acceso a una función que consulta la BBDD debe heredar el mismo contexto de tenant que el request original, no ejecutarse con permisos elevados.
+    Buenas prácticas
+    Autorización basada en políticas explícitas (ABAC/RBAC) evaluadas en un punto central, no dispersas en cada controlador.
+    Tests de penetración internos específicos: intentar, autenticado como tenant A, acceder a recursos de tenant B por ID directo (ej. /api/conversaciones/{id} con un ID que pertenece a otro tenant) — este es el test de aislamiento más básico y el que más suele fallar en auditorías reales.
+    Principio de mínimo privilegio también para el propio backend: el usuario de BBDD que usa la aplicación no debería poder hacer BYPASS RLS (en Postgres, el rol BYPASSRLS debe reservarse solo para tareas administrativas offline).
+    Pueden ser exigidos en una auditoria de seguridad por cualquier cliente antes de firmar el contrato para cumplir con el (ISO 27001, SOC 2)
+
+
+"""Aspecto a tener en cuenta en cuanto a uso de tokens"""
+Si implementamos guardrails de IA que validan que el agente no intente acceder a datos fuera de su tenant, eso añade una llamada extra (o un paso de validación) que puede sumar tokens si se hace vía LLM en vez de vía código determinista. Recomendación: esta validación debe ser código determinista (if tenant_id != contexto → rechazar), nunca delegada al LLM, porque un LLM puede ser manipulado vía prompt injection para saltarse una instrucción en texto.
+
+3.- Métricas, Logs, y rate limiting, toda esta observabilidad debe estar etiquetada y agregada por tenant_id, nno solo a nivel global, esto nos permite diagnosticar problemas especificos de un cliente, establecer planes de precios basados en eluso real y aislar el impacto de un tenant abusivo som afectar a los demas. Los problemas que presenta esta sección son logs con datos personales , rate limiting mal implementado. La solucion conlleva una larga explicación que redactare en detalles_tecnicos.md. (Crear indice de notas) 
+
+Costes en tokens
+
+Aquí es donde el tracking de tokens por tenant (ya diseñado en el punto anterior de la conversación) se conecta directamente con el rate limiting: la lógica de "tenant X ha superado 100k tokens este mes en plan Basic → bloquear o degradar a modelo más barato" debe evaluarse en tiempo real, antes de hacer la llamada al LLM (para no gastar la llamada y luego rechazar).
+
+4.- Independencia de la estructura arquitectónica: sus problemas se centran mas en la migración de uno a otro si no hay un diseño inicial consceinte de que esto pueda pasar. No aplica a nuestro caso.
+
+# Ideas principales
+
+## Análisis de nivel vertical de clientes
+
+Se deberia de analizar si el cliente a entrar en dicha arquitectura esta al mismo nivel vertical que los demás ya que puede suponer una degradacion de rendimientos en los demas tenant. Posible solucion crear una solucion especifica para el cliente o si se prevee clientes con mismas necesidades crear otro multitenant(estudiar viabilidad para rdto optimo sin latencais), de dicha manera nos quitamos los incovenientes de escalabilidad vertical. Para ello deberiamos visualizar el nivel previsto de exigencias y escoger un stack diferente según las necesidades.
+
+## Decisión de estructura de BBDD
+
+Tras analizar como se podria estructurar la bbdd según las diferentes exigencias de los clientes, llego a la conclusión en nuestro caso que lo mas conveniente seria **Shared schema (pool) + Row-Level Security**, sin particionado ni sharding.
+
+¿Porque? El sharding nos cubre de problemas que en principio no necesitamos cubrir debido a las necesidades de nuestro caso, si aceptaramos una escalabilidad de clientes dentro de este multitenant estudiariamos la opción mas viable para una migración, si no se diseña algo personal u otro multitenant, de la misma manera para el particionado físico, ya que esta resuuelve problemas para el borrado rapido cuando las tablas son demasiado grandes, por lo que el delete masivo es un cuello de botella real, ademas que el mantenimiento constante no lo hace práctico debidoal consumo de tiempo para nuestra situación, no es óptimo, particionar por `tenant_id` es una optimización de escala y de operaciones (borrado rápido, rendimiento en tablas grandes) que no aporta seguridad, y con exigencia media-baja el problema que resuelve todavía no existe — así que solo queda el coste de mantenerla, sin el beneficio.
+
+Para el caso de extender el eje a cómputo, red y cuenta cloud es una opción muy interesante pero lo descarto por la sencilla razón de nuestro target (la complejidad de explicar y auditar va a cada capa y para casos reales a los que apuntamos no tiene sentido dicha caer en dicha complejidad, ya que complicariamos mucho la venta del SaaS y perderiamos potenciales clientes), tampoco se benefician los problemas que resuelve ya que aisla cómputos para no saturar la cpu/memoria cosa que no nos va a pasar al igual que el aislamiento por red ya que es altamente burocratico (sector financiero, salud y defensa) como con cuenta cloud, que normamelmente lo piden clientes de auditorias. El despliegue serai muy grande porque dependeria de N desiciones independientes cada uno con su propio coste, además de que al requerir tanta configuración se puede caer en la incosistencia, en deefinitica contradice nuestro argumento de coste-beneficio.
+
+## Buenas prácticas de seguridad
+
+En buenas practicas para la seguridad aconsejan seguir 4 pasos:
+
+### 1. `tenant_id` con token de autenticación (JWT)
+
+Esto supone ventajas en seguridad ya que el cliente no puede alterar su propio `tenant_id`, pero presenta varios incovenientes sensibles a considerar y subsanar.
+
+Primero: JWT con TTL largo, si el ususario cambia de tenant (como sera nuestro caso) el token queda desactualizado hasta que expira o se refresca, esto supone un impacto a nivel producción, y se puede dar en escenarios como:
+
+- 1.1 Usuario expulsado de un tenant mid-sesion
+- 1.2 Tenant suspendido
+- 1.3 Usuario con membership en varios tenants
+- 1.4 Downgrade de plan/permisos
+
+La solución para estos casos con agentes de IA interviniendo, consiste en:
+
+- recortar el TTL para el acces token,
+- revalidación server-side en operaciones sensibles (no confiar unicamente en el JWT),
+- establecer una blacklist para que los tokens emitidos de un tenant suspendido dejen de ser válidos
+- refresh token rotation con validacion de membership
+- forzar reissue de token al cambiar de tenant activo (para los casos de multitentant membership, al hacer el cambio de contexto en la UI dispare la llamada al backend para estar conectado a su tenant correcto y evitar el error de desajuste en frontend)
+- Contrastar el `tenant_id` contra el JWT, no confiar que venga en el body o en la URL, es una vulnerabilidad de esalacion horizontal si no se hace.
+- JWT firmado con un secreto/clave que nunca este expuesta en el cliente ni en el código fuente. (Vault/AWS Secrets)
+- Usar RS256 (firma asimétrica) en vez de HS256 (simétrica) si vas a validar el JWT en múltiples servicios/microservicios — así solo el servicio de auth tiene la clave privada, y el resto solo necesita la pública para verificar.
+- Incluir también el `user_id` y roles dentro del mismo JWT para no tener que hacer una consulta adicional a BBDD en cada request solo para autorización.
+
+### 2. Autorización y seguridad
+
+Capa especialmente buena para procesos B2B. Presenta dos puntos críticos a resolver:
+
+- 2.1 Doble capa obligatoria: autorizacion a nivel de aplicacion (middleware) y autorización a nivel de BBDD (nuestro RLS)
+- 2.2 Los agentes de IA al tener function-calling con acceso a una función que consulta la BBDD debe heredar el mismo contexto de tenant que el request original, no ejecutarse con permisos elevados.
+
+**Buenas prácticas**
+
+- Autorización basada en políticas explícitas (ABAC/RBAC) evaluadas en un punto central, no dispersas en cada controlador.
+- Tests de penetración internos específicos: intentar, autenticado como tenant A, acceder a recursos de tenant B por ID directo (ej. `/api/conversaciones/{id}` con un ID que pertenece a otro tenant) — este es el test de aislamiento más básico y el que más suele fallar en auditorías reales.
+- Principio de mínimo privilegio también para el propio backend: el usuario de BBDD que usa la aplicación no debería poder hacer BYPASS RLS (en Postgres, el rol `BYPASSRLS` debe reservarse solo para tareas administrativas offline).
+- Pueden ser exigidos en una auditoria de seguridad por cualquier cliente antes de firmar el contrato para cumplir con el (ISO 27001, SOC 2)
+
+> **Aspecto a tener en cuenta en cuanto a uso de tokens**
+>
+> Si implementamos guardrails de IA que validan que el agente no intente acceder a datos fuera de su tenant, eso añade una llamada extra (o un paso de validación) que puede sumar tokens si se hace vía LLM en vez de vía código determinista. Recomendación: esta validación debe ser código determinista (`if tenant_id != contexto → rechazar`), nunca delegada al LLM, porque un LLM puede ser manipulado vía prompt injection para saltarse una instrucción en texto.
+
+### 3. Métricas, Logs, y rate limiting
+
+Toda esta observabilidad debe estar etiquetada y agregada por `tenant_id`, nno solo a nivel global, esto nos permite diagnosticar problemas especificos de un cliente, establecer planes de precios basados en eluso real y aislar el impacto de un tenant abusivo som afectar a los demas.
+
+Los problemas que presenta esta sección son logs con datos personales, rate limiting mal implementado. La solucion conlleva una larga explicación que redactare en `detalles_tecnicos.md`. (Crear indice de notas)
+
+**Costes en tokens**
+
+Aquí es donde el tracking de tokens por tenant (ya diseñado en el punto anterior de la conversación) se conecta directamente con el rate limiting: la lógica de "tenant X ha superado 100k tokens este mes en plan Basic → bloquear o degradar a modelo más barato" debe evaluarse en tiempo real, antes de hacer la llamada al LLM (para no gastar la llamada y luego rechazar).
+
+### 4. Independencia de la estructura arquitectónica
+
+Sus problemas se centran mas en la migración de uno a otro si no hay un diseño inicial consceinte de que esto pueda pasar. No aplica a nuestro caso.
