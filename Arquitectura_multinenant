@@ -7,7 +7,7 @@ Patrón arquitectónico donde una única instancia de aplicación (código, y a 
 Existen tres modelos principales:
 
 | Modelo | Descripción |
-|---|---|
+
 | **Shared database, shared schema** | Todos los tenants en las mismas tablas, diferenciados por una columna `tenant_id`. |
 | **Shared database, separate schema** | Mismo motor de BBDD, un *schema* por tenant. |
 | **Separate database per tenant** | Aislamiento total a nivel de instancia de BBDD. |
