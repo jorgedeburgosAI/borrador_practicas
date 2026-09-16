@@ -123,9 +123,80 @@ IMPORTANTE TESTEAR
 
 Se deberia de analizar si el cliente a entrar en dicha arquitectura esta al mismo nivel vertical que los demás ya que puede suponer una degradacion de rendimientos en los demas tenant. Posible solucion crear una solucion especifica para el cliente o si se prevee clientes con mismas necesidades crear otro multitenant(estudiar viabilidad para rdto optimo sin latencais), de dicha manera nos quitamos los incovenientes de escalabilidad vertical. Para ello deberiamos visualizar el nivel previsto de exigencias y escoger un stack diferente según las necesidades.
 
+Row-Level Security como mecanismo, no como capa
+Dentro de shared schema, la pregunta "¿quién impone el aislamiento?" es ortogonal a dónde viven los datos. Sin RLS, el aislamiento depende de que la app nunca olvide el WHERE tenant_id = ?. Con RLS, el motor de BBDD lo impone aunque la query de la capa de aplicación esté mal escrita. Mismo modelo de datos (shared schema), garantía distinta.
 
 Opciones en multitenant
+
+Una vez analizados los cientes deberiamos establecer la arquitectura de la bbdd a usar: 
+Pool = shared schema
+Bridge = shared DB, separate schema
+Silo = separate database per tenant
+
+Sharding (pool particionado): Es N instancias, y cada tenant se asigna a una vía hash/rango/tabla de enrutamiento. No renta debido a:
+
+Cuando el número de tenants crece tanto que una sola instancia empieza a tener problemas de rendimiento reales (no anticipados, medidos).
+Cuando aparece un segmento de clientes con exigencia alta mezclado con el resto, y ahí el sharding (o mejor, una estrategia híbrida por tier) sí resuelve algo concreto.
+Cuando hay requisitos de compliance que obligan a cierto aislamiento, algo que no mencionas que sea el caso.
+
+RLS; Row-Level Security (RLS) en shared schema
+
+Ventajas:
+
+Aislamiento a nivel de motor de BBDD, no solo de aplicación: aunque un desarrollador olvide el WHERE tenant_id = ? en una query, la BBDD igualmente filtra.
+Reduce drásticamente la superficie de bugs de fuga de datos entre tenants, que es uno de los fallos más graves y comunes en shared schema.
+No requiere cambiar el modelo de datos ni el despliegue — se añade sobre lo que ya tienes.
+
+Desventajas:
+
+Overhead de rendimiento: cada query pasa por una política de seguridad adicional; en tablas grandes con políticas complejas puede notarse.
+Complejidad de configuración y mantenimiento: cada tabla nueva necesita su política, y es fácil olvidarse de aplicarla en una tabla nueva (aunque menos grave que olvidarlo en la app, sigue siendo un punto de fallo).
+Debugging más difícil: cuando una query "no devuelve lo esperado", a veces es la política RLS actuando de forma no obvia, y hay que tenerlo en cuenta al depurar.
+No es soportado igual en todos los motores (Postgres lo tiene muy maduro; MySQL no tiene RLS nativo, por ejemplo — habría que emular con vistas).
+ Particionado físico por tenant_id + RLS — ventajas y desventajas combinadas
+
+Ventajas:
+
+Son complementarios, no redundantes: la partición te da rendimiento (partition pruning) y borrado rápido; RLS te da seguridad (el motor impone el filtro aunque la app falle). Cubres dos problemas distintos con un solo diseño.
+Offboarding de un tenant (GDPR, baja de cliente) pasa de DELETE lento a DROP PARTITION casi instantáneo, con la garantía extra de que RLS sigue protegiendo mientras tanto.
+Si tienes ambos, un bug de aplicación que olvide el WHERE tenant_id no filtra datos ajenos (por RLS), aunque pierdas el beneficio de pruning en esa query concreta.
+
+Desventajas:
+
+Doble mantenimiento: cada tabla nueva necesita partición y política RLS definidas; te puedes olvidar de una de las dos, y es fácil que la partición avance sin que la política RLS se actualice igual.
+El pruning solo se activa si la query incluye el filtro de tenant_id explícitamente — si no, escaneas todas las particiones igual, y ahí sigue pesando el overhead de evaluar la política RLS en cada una.
+Con muchos tenants, partición por tenant individual se vuelve inmanejable (miles de particiones = overhead de metadatos); tendrías que agrupar por hash/rango, perdiendo parte del beneficio de "borrado instantáneo por tenant".
+Migraciones de esquema más pesadas: un cambio de columna se aplica a cada partición, y hay que verificar que las políticas RLS lo sigan cubriendo.
+
+¿Rentable con clientes de exigencia media-baja?
+
+Aquí conviene separar los dos mecanismos, porque no valen lo mismo:
+
+RLS solo: sí compensa, incluso con exigencia baja. No es una feature de rendimiento ligada al volumen — es una red de seguridad barata de implementar sobre shared schema, y el riesgo que mitiga (fuga de datos entre tenants por bug de app) no depende de cuánto factura o exige el cliente. Es coste bajo, beneficio constante.
+Particionado físico solo: no compensa. Sus ventajas (pruning, borrado rápido) solo se notan cuando el volumen de datos por tabla es alto o el offboarding de tenants es frecuente. Con exigencia media-baja, una tabla sin particionar aguanta de sobra, y te ahorras la complejidad de mantener particiones sincronizadas con el esquema.
+
+Punto crítico real: si usas un pool de conexiones (PgBouncer, por ejemplo), SET a nivel de sesión puede "filtrarse" entre requests si el pool reutiliza conexiones sin resetear la variable. Esto es un error de producción documentado en varios post-mortems de SaaS reales — hay que resetear explícitamente la variable al devolver la conexión al pool, o usar SET LOCAL dentro de una transacción para que el scope sea por transacción, no por sesión.
+
+Resolución de tenant: dónde y cómo
+
+El patrón correcto es resolver el tenant una sola vez, en el borde de la aplicación (middleware de autenticación), nunca dentro de la lógica de negocio:
+
+El JWT lleva el tenant_id firmado por el servidor (nunca generado o modificable por el cliente).
+El middleware valida el JWT, extrae tenant_id, y lo inyecta en el contexto de la request.
+La capa de acceso a datos (ORM/query builder) lee ese contexto automáticamente — el desarrollador de negocio nunca escribe tenant_id a mano en una query.
+
+Con ORMs como Prisma o SQLAlchemy esto se implementa con hooks/interceptors globales, no repitiendo el filtro en cada repositorio.
 
 Seguridad: lo analizare en el archivo idea_seguridad.md
 
 
+
+
+
+
+COSAS EN LIMPIO:
+
+Tras analizar como se podria estructurar la bbdd según las diferentes exigencias de los clientes, llego a la conclusión en nuestro caso que lo mas conveniente seria Shared schema (pool) + Row-Level Security, sin particionado ni sharding. ¿Porque? El sharding nos cubre de problemas que en principio
+no necesitamos cubrir debido a las necesidades de nuestro caso, si aceptaramos una escalabilidad de clientes dentro de este multitenant estudiariamos la opción mas viable para una migración, si no se diseña algo personal u otro multitenant, de la misma manera para el particionado físico, ya que esta resuuelve problemas para el borrado rapido cuando las tablas son demasiado grandes, por lo que el delete masivo es un cuello de botella real, ademas que el mantenimiento constante no lo hace práctico debidoal consumo de tiempo para nuestra situación, no es óptimo, particionar por tenant_id es una optimización de escala y de operaciones (borrado rápido, rendimiento en tablas grandes) que no aporta seguridad, y con exigencia media-baja el problema que resuelve todavía no existe — así que solo queda el coste de mantenerla, sin el beneficio. Para el caso de extender el eje a cómputo, red y cuenta cloud es una opción muy interesante pero lo descarto por la sencilla razón de nuestro target (la complejidad de explicar y auditar va a cada capa y para casos reales a los que apuntamos no tiene sentido dicha caer en dicha complejidad, ya que complicariamos mucho la venta del SaaS y perderiamos potenciales clientes), tampoco se benefician los problemas que resuelve ya que aisla cómputos para no saturar la cpu/memoria cosa que no nos va a pasar al igual que el aislamiento por red ya que es altamente burocratico (sector financiero, salud y defensa) como con cuenta cloud, que normamelmente lo piden clientes de auditorias.El despliegue serai muy grande porque dependeria de N desiciones independientes cada uno con su propio coste, además de que al requerir tanta configuración se puede caer en la incosistencia, en deefinitica contradice nuestro argumento de coste-beneficio.
+
+RLS:
