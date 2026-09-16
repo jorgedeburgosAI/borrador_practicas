@@ -1,4 +1,4 @@
-# 🎙️ Plataforma SaaS de Agentes de Voz con IA — Visión de Producto y Arquitectura
+# Plataforma SaaS de Agentes de Voz con IA — Visión de Producto y Arquitectura
 
 ## 1. Por qué este proyecto: la oportunidad de negocio
 
